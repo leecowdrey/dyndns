@@ -1,4 +1,4 @@
-# Dynamic DNS for Google Domains
+# Dynamic DNS for CloudFloor DNS (mtgsy)
 
 ## PID of dyndns:
 
