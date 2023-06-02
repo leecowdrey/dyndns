@@ -1,0 +1,279 @@
+#! /bin/bash
+#/usr/local/bin/dyngoo
+NAME="${0##*/}"
+PATH_TO_SCRIPT="${0}"
+PATH_PARENT="${0%/*}"
+CONFIG_FILE="/etc/${NAME}.json"
+PID_FILE="/var/run/${NAME}.pid"
+RETVAL=0
+SLEEP_INTERVAL=60
+USER_AGENT=""
+CONNECT_TIMEOUT=0
+MAX_TIME=0
+API_USERNAME=""
+API_PASSWORD=""
+CHECK_IP_URL=""
+NETWORK_DOMAIN=""
+NETWORK_HOST=""
+WAN_INTERFACE=""
+UPDATE_HOSTS="false"
+RELOAD_ITEMS=9
+BACKOFF_FACTOR=0
+RELOAD_ITEMS=0
+NETWORK_WAN_IP="0.0.0.0"
+NETWORK_FQDN=""
+NETWORK_AUX=0
+NETWORK_TTL=0
+USER_AGENT="${NAME}/1.0"
+PID=$$
+
+do_logger () {
+  /usr/bin/logger --id=${PID} -t "${NAME}" "${1}"
+}
+
+do_read_config () {
+  BACKOFF_FACTOR=0
+  SLEEP_INTERVAL=$(jq -r ".daemon.sleep_interval" ${CONFIG_FILE})
+  USER_AGENT=$(jq -r ".daemon.user_agent" ${CONFIG_FILE})
+  CONNECT_TIMEOUT=$(jq -r ".daemon.connect_timeout" ${CONFIG_FILE})
+  MAX_TIME=$(jq -r ".daemon.max_time" ${CONFIG_FILE})
+  API_USERNAME=$(jq -r ".api.username" ${CONFIG_FILE})
+  API_PASSWORD=$(jq -r ".api.password" ${CONFIG_FILE})
+  CHECK_IP_URL=$(jq -r ".check_ip_url" ${CONFIG_FILE})
+  NETWORK_DOMAIN=$(jq -r ".domains.domain" ${CONFIG_FILE})
+  NETWORK_HOST=$(jq -r ".domains.host" ${CONFIG_FILE})
+  NETWORK_AUX=$(jq -r ".domains.aux" ${CONFIG_FILE})
+  NETWORK_TTL=$(jq -r ".domains.ttl" ${CONFIG_FILE})
+  WAN_INTERFACE=$(jq -r ".daemon.server.wan_interface" ${CONFIG_FILE})
+  UPDATE_HOSTS=$(jq -r ".daemon.server.update_hosts" ${CONFIG_FILE})
+  RELOAD_ITEMS=$(jq -r ".daemon.server.reloads | length" ${CONFIG_FILE})
+  NETWORK_FQDN="${NETWORK_HOST}.${NETWORK_DOMAIN}"
+  do_logger "INFO|${NAME}|sleep interval ${SLEEP_INTERVAL} seconds"
+}
+
+do_start () {
+  pushd /tmp &>/dev/null
+  if [ $(/usr/bin/id -u) -ne 0 ] ; then
+     do_logger "FATAL|${NAME} script must be run as root"
+     exit 250
+  fi
+  test -x /usr/bin/jq || exit 252
+  test -x /usr/bin/curl || exit 252
+  test -x /usr/bin/logger || exit 252
+  test -x /bin/sed || exit 252
+  test -x /bin/systemctl || exit 252
+  # check parameter file exists and is readable
+  if [ ! -r "${CONFIG_FILE}" ] ; then
+   exit 251
+  fi
+  echo -n "${PID}" > ${PID_FILE}
+  do_read_config
+  do_logger "INFO|started"
+}
+
+do_exit () {
+  if [ -f ${PID_FILE} ] ; then
+    rm -f ${PID_FILE} &>/dev/null
+  fi
+  popd &>/dev/null
+  JOBS=$(jobs -pr)
+  if [ -n "${JOBS}" ] ; then
+    kill ${JOBS} &>/dev/null
+  fi
+  exit ${RETVAL}
+}
+
+do_clean_exit () {
+  do_logger "EXIT"
+  do_exit
+}
+
+# ALRM (alarm clock)
+do_sigalrm () {
+  do_logger "now active"
+}
+
+do_sigint () {
+  do_exit
+}
+
+do_sigkill () {
+  do_logger "kill received"
+  do_exit
+}
+
+do_sigterm () {
+  do_logger "terminate received"
+  do_exit
+}
+
+# HUP (hang up)
+do_sighup () {
+  # re-read any configuration value that have read previouly
+  # anything not yet defined ignore as will be read later
+  do_logger "hang up received, updating configuration from ${CONFIG_FILE}"
+  do_read_config
+}
+
+# reload other daemons
+do_reloads () {
+  local RETVAL=0
+  local RELOAD_ITEM=0
+
+  if [ ${RELOAD_ITEMS} -gt 0 ] ; then
+    while [ ${RELOAD_ITEM} -lt ${RELOAD_ITEMS} ] ; do
+      local RELOAD_UNIT=$(jq -r ".daemon.server.reloads[${RELOAD_ITEM}]" ${CONFIG_FILE})
+      if [ -n "${RELOAD_UNIT}" ] ; then
+        systemctl reload-or-restart ${RELOAD_UNIT} &>/dev/null
+        RETVAL=$?
+        if [ ${RETVAL} -eq 0 ] ; then
+          do_logger "INFO|reload-or-restart|${RELOAD_ITEM}|${RELOAD_UNIT}|${RETVAL}"
+        else
+          do_logger "ERROR|reload-or-restart|${RELOAD_ITEM}|${RELOAD_UNIT}|${RETVAL}"
+        fi
+      fi
+      ((RELOAD_ITEM=RELOAD_ITEM+1))
+    done
+  fi
+  return ${RETVAL}
+}
+
+# trap signals and start
+trap do_sighup HUP
+trap do_sigint INT
+trap do_sigkill KILL
+trap do_sigalrm ALRM
+trap do_sigterm TERM
+do_start
+
+while [ true ] ; do
+  # endless loop with programmatically controlled delay
+
+  while [ true ] ; do
+    WAN_UP=$(ifconfig -s | grep ${WAN_INTERFACE} | wc -l)
+    if [ ${WAN_UP} -gt 0 ] ; then
+      break
+    fi
+    if [ ${SLEEP_INTERVAL} -gt 0 ] ; then
+      # handle signals during sleep by pushing sleep to child process
+      # if curl fails then BACKUP_FACTOR will increment to delay loop further
+      # inactive state
+      do_logger "waiting for interface up on ${WAN_INTERFACE}"
+      sleep $((SLEEP_INTERVAL+BACKOFF_FACTOR)) &
+      wait $!
+    fi
+  done
+
+  # get assigned IP of WAN interface
+  WAN_IP=$( /sbin/ifconfig ${WAN_INTERFACE}| grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' )
+
+  # get hosts file WAN IP
+  OLD_WAN_IP=$( grep "${NETWORK_HOST}" /etc/hosts | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' )
+
+  # get dns providers A record for WAN IP
+  DIG_WAN_IP=$(dig @dns0.mtgsy.co.uk. +short ${NETWORK_HOST}.${NETWORK_DOMAIN} -t A)
+
+  # get WAN IP from Google
+  NETWORK_WAN_IP=$( curl -s \
+                  --insecure \
+                  --connect-timeout ${CONNECT_TIMEOUT} \
+                  --max-time ${MAX_TIME} \
+                  --user-agent "${USER_AGENT}" \
+		  -H "Cache-control: no-cache" \
+		  -H "Accept: */*" \
+		  --location --request GET \
+                  ${CHECK_IP_URL} )
+  RETVAL=$?
+
+  # for the record
+  #do_logger "INFO|${NETWORK_FQDN}|hosts:${OLD_WAN_IP}|${WAN_INTERFACE}:${WAN_IP}|mtgsy:${DIG_WAN_IP}|google:${NETWORK_WAN_IP}"
+
+  # update hosts file if necessary and undertake any reloads
+  if [ "${OLD_WAN_IP,,}" != "${NETWORK_WAN_IP,,}" ] ; then
+    if [ "${UPDATE_HOSTS,,}" == "true" ] ; then
+      /bin/sed -i "/${NETWORK_HOST}/ s/.*/${NETWORK_WAN_IP}\t${NETWORK_HOST}/g" /etc/hosts
+      RETVAL=$?
+      do_logger "INFO|${NETWORK_FQDN}|${NETWORK_HOST}|${OLD_WAN_IP}|${NETWORK_WAN_IP}"
+      if [ ${RETVAL} -eq 0 ] ; then
+        do_reloads
+	RETVAL=$?
+      fi
+    fi
+  fi
+
+  if [ "${NETWORK_WAN_IP,,}" != "${DIG_WAN_IP,,}" ] ; then
+    DNS_TMP=$(mktemp)
+    curl -o ${DNS_TMP} -w '%{http_code}' -s \
+                    --connect-timeout ${CONNECT_TIMEOUT} \
+                    --max-time ${MAX_TIME} \
+                    --user-agent "${USER_AGENT}" \
+	  	    -H "Cache-control: no-cache" \
+	 	    -H "Accept: */*" \
+	  	    --location --request GET \
+		    "https://www.mtgsy.net/dns/api.php?command=updaterecord&username=${API_USERNAME}&apikey=${API_PASSWORD}&domainname=${NETWORK_DOMAIN}&name=${NETWORK_HOST}&type=A&data=${NETWORK_WAN_IP}&aux=${NETWORK_AUX}&ttl=${NETWORK_TTL}"
+    NETWORK_RETVAL=$?
+    if [ -f "${DNS_TMP}" ] ; then
+      NETWORK_RESPONSE=$(tail -1 ${DNS_TMP})
+      rm -f ${DNS_TMP} &>/dev/null
+    else
+      NETWORK_RESPONSE="0"
+    fi
+    case "${NETWORK_RESPONSE:0:3}" in
+      800) 
+                do_logger "INFO|${NETWORK_FQDN}|${NETWORK_WAN_IP}|OK"
+                BACKOFF_FACTOR=0
+                RETVAL=0
+                ;;
+      400)
+                do_logger "ERROR|${NETWORK_FQDN}|${NETWORK_WAN_IP}|No domain name specified"
+                ((BACKOFF_FACTOR=BACKOFF_FACTOR+11))
+                RETVAL=1
+                ;;
+      100)
+                do_logger "ERROR|${NETWORK_FQDN}|${NETWORK_WAN_IP}|Balance insufficient"
+                ((BACKOFF_FACTOR=BACKOFF_FACTOR+11))
+                RETVAL=1
+                ;;
+      300)
+                do_logger "ERROR|${NETWORK_FQDN}|${NETWORK_WAN_IP}|Invalid login information supplied"
+                ((BACKOFF_FACTOR=BACKOFF_FACTOR+11))
+                RETVAL=1
+                ;;
+      305)
+                do_logger "ERROR|${NETWORK_FQDN}|${NETWORK_WAN_IP}|Domain not found"
+                ((BACKOFF_FACTOR=BACKOFF_FACTOR+11))
+                RETVAL=1
+                ;;
+      310)
+                do_logger "ERROR|${NETWORK_FQDN}|${NETWORK_WAN_IP}|Record not found / problem adding record"
+                ((BACKOFF_FACTOR=BACKOFF_FACTOR+11))
+                RETVAL=1
+                ;;
+      200)
+                do_logger "ERROR|${NETWORK_FQDN}|${NETWORK_WAN_IP}|Insufficient information supplied"
+                ((BACKOFF_FACTOR=BACKOFF_FACTOR+11))
+                RETVAL=1
+                ;;
+      *)
+                do_logger "FATAL|${NETWORK_FQDN}|${NETWORK_WAN_IP}|${NETWORK_RESPONSE/%\ */}"
+                ((BACKOFF_FACTOR=BACKOFF_FACTOR+11))
+                RETVAL=2
+                ;;
+    esac  
+  else
+	        do_logger "INFO|${NETWORK_FQDN}|${NETWORK_WAN_IP}|NOCHG"
+                BACKOFF_FACTOR=0
+                RETVAL=0
+  fi
+
+  if [ ${SLEEP_INTERVAL} -gt 0 ] ; then
+    # handle signals during sleep by pushing sleep to child process
+    # if curl fails then BACKUP_FACTOR will increment to delay loop further
+    # inactive state
+    sleep $((SLEEP_INTERVAL+BACKOFF_FACTOR)) &
+    wait $!
+  fi
+done
+
+#
+do_clean_exit

@@ -1,0 +1,28 @@
+{
+  "daemon": {
+    "sleep_interval": 7200,
+    "user_agent": "dyndns/1.0",
+    "connect_timeout": 5,
+    "max_time": 25,
+    "server": {
+      "wan_interface": "ppp0",
+      "update_hosts": true,
+      "reloads": [
+         "ssh",
+         "openvpn",
+	      "knockd"
+      ]
+    }
+  },
+  "api": {
+    "username": "apiUsername",
+    "password": "apiPassword"
+  },
+  "check_ip_url": "https://domains.google.com/checkip",
+  "domains": {
+    "domain": "domain.tld",
+    "host": "hostname",
+    "aux": 0,
+    "ttl": 3600
+  }
+}

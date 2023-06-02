@@ -1,0 +1,16 @@
+[Unit]
+Description=Dynamic DNS for Google Domains
+After=network.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=root
+Type=simple
+Restart=on-failure
+RestartSec=30
+PIDFile=/var/run/dyndns.pid
+ExecStart=/usr/local/sbin/dyndns
+
+[Install]
+WantedBy=default.target
