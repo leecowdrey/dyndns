@@ -1,5 +1,5 @@
 [Unit]
-Description=Dynamic DNS for Google Domains
+Description=Dynamic DNS for CloudFloor DNS (mtgsy)
 After=network.target
 After=network-online.target
 StartLimitIntervalSec=0
